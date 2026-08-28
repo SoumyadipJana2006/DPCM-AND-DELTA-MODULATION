@@ -1,2 +1,317 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ============================================================
+# USER INPUTS
+# ============================================================
+
+Fs = float(input("Enter Sampling Frequency Fs (Hz): "))
+Delta = float(input("Enter Delta Step Size (Δ): "))
+L = int(input("Enter Number of Quantization Levels (L): "))
+
+# ============================================================
+# SIGNAL PARAMETERS
+# ============================================================
+
+duration = 1.0
+f = float(input("Enter Signal Frequency (Hz): "))
+A = 1.0
+
+# ============================================================
+# TIME AXIS
+# ============================================================
+
+t = np.arange(0, duration, 1/Fs)
+
+# ============================================================
+# TEST SIGNALS
+# ============================================================
+
+slow_signal  = A * np.sin(2*np.pi*f*t)
+rapid_signal = A * np.sin(2*np.pi*(5*f)*t)
+
+# ============================================================
+# UNIFORM QUANTIZER  (fixed-range version, reused by PCM and DPCM)
+# ============================================================
+
+def uniform_quantizer(x, xmin, xmax, levels):
+    """
+    Uniform quantizer over an explicit fixed range [xmin, xmax].
+    Works on scalars or arrays. Returns (quantized_value, step_size).
+    """
+    step = (xmax - xmin) / (levels - 1)
+    x_clipped = np.clip(x, xmin, xmax)
+    q_index = np.round((x_clipped - xmin) / step)
+    xq = xmin + q_index * step
+    return xq, step
+
+
+# ============================================================
+# PCM IMPLEMENTATION
+# ============================================================
+
+def PCM(signal, levels):
+    xmin, xmax = np.min(signal), np.max(signal)
+    quantized, step = uniform_quantizer(signal, xmin, xmax, levels)
+    error = signal - quantized
+    mse = np.mean(error**2)
+    return quantized, error, mse
+
+
+# ============================================================
+# FIRST ORDER DPCM  (fixed: proper causal feedback loop)
+# ============================================================
+
+def DPCM(signal, levels):
+    """
+    Correct closed-loop first-order DPCM:
+
+        predicted[n]     = reconstructed[n-1]     <- previous RECONSTRUCTED
+                                                       sample, not raw signal
+        error[n]         = signal[n] - predicted[n]
+        q_error[n]       = quantize(error[n])
+        reconstructed[n] = predicted[n] + q_error[n]
+
+    (Previous bug: predicted[] was computed for the whole array before any
+    reconstruction existed, so it read back zeros instead of the previous
+    reconstructed sample. That silently turned DPCM into "predict zero",
+    which is why it gave no real advantage over PCM. Fixed by running
+    prediction -> quantization -> reconstruction sample-by-sample in one
+    causal loop.)
+    """
+    N = len(signal)
+
+    predicted        = np.zeros(N)
+    prediction_error = np.zeros(N)
+    quantized_error  = np.zeros(N)
+    reconstructed    = np.zeros(N)
+
+    reconstructed[0] = signal[0]
+
+    # The quantizer's range for the prediction error can't be measured
+    # causally one sample at a time, so estimate a fixed range up front
+    # from the signal's first difference (a standard simplification).
+    approx_error = np.diff(signal)
+    e_min, e_max = np.min(approx_error), np.max(approx_error)
+    step = (e_max - e_min) / (levels - 1)
+
+    for n in range(1, N):
+        predicted[n] = reconstructed[n-1]
+        prediction_error[n] = signal[n] - predicted[n]
+
+        q_index = np.round((np.clip(prediction_error[n], e_min, e_max) - e_min) / step)
+        quantized_error[n] = e_min + q_index * step
+
+        reconstructed[n] = predicted[n] + quantized_error[n]
+
+    mse = np.mean((signal - reconstructed)**2)
+
+    return predicted, prediction_error, quantized_error, reconstructed, mse
+
+
+# ============================================================
+# DELTA MODULATION
+# ============================================================
+
+def delta_modulation(signal, delta):
+    N = len(signal)
+    staircase = np.zeros(N)
+    bits = np.zeros(N)
+
+    for n in range(1, N):
+        if signal[n] >= staircase[n-1]:
+            staircase[n] = staircase[n-1] + delta
+            bits[n] = 1
+        else:
+            staircase[n] = staircase[n-1] - delta
+            bits[n] = 0
+
+    mse = np.mean((signal - staircase)**2)
+    return bits, staircase, mse
+
+
+# ============================================================
+# ADAPTIVE DELTA MODULATION
+# ============================================================
+
+def adaptive_delta_modulation(signal, delta):
+    N = len(signal)
+    staircase = np.zeros(N)
+    bits = np.zeros(N)
+    adaptive_delta = delta
+
+    for n in range(1, N):
+        if signal[n] >= staircase[n-1]:
+            staircase[n] = staircase[n-1] + adaptive_delta
+            bits[n] = 1
+        else:
+            staircase[n] = staircase[n-1] - adaptive_delta
+            bits[n] = 0
+
+        if n > 1:
+            if bits[n] == bits[n-1]:
+                adaptive_delta *= 1.1   # same direction twice -> ramp up (slope overload)
+            else:
+                adaptive_delta *= 0.9   # direction flipped -> ramp down (granular noise)
+
+    mse = np.mean((signal - staircase)**2)
+    return staircase, mse
+
+
+# ============================================================
+# RUN PCM
+# ============================================================
+
+pcm_signal, pcm_error, pcm_mse = PCM(slow_signal, L)
+
+# ============================================================
+# RUN DPCM
+# ============================================================
+
+(predicted,
+ prediction_error,
+ quantized_error,
+ reconstructed,
+ dpcm_mse) = DPCM(slow_signal, L)
+
+# ============================================================
+# DELTA MODULATION
+# ============================================================
+
+dm_bits, dm_staircase, dm_mse = delta_modulation(slow_signal, Delta)
+
+# ============================================================
+# ADAPTIVE DELTA MODULATION
+# ============================================================
+
+adm_staircase, adm_mse = adaptive_delta_modulation(slow_signal, Delta)
+
+# ============================================================
+# VALIDATION OF DELTA MODULATION
+# ============================================================
+
+step_changes = np.diff(dm_staircase)
+valid = np.all(np.isclose(np.abs(step_changes), Delta))
+
+print("\n==============================")
+print("MANDATORY VALIDATION")
+print("==============================")
+
+if valid:
+    print("PASS")
+    print("Every staircase step changes by ±Δ")
+else:
+    print("FAIL")
+    print("Some staircase steps are not ±Δ")
+
+# ============================================================
+# RESULTS
+# ============================================================
+
+print("\n==============================")
+print("ERROR COMPARISON")
+print("==============================")
+
+print("PCM MSE  =", pcm_mse)
+print("DPCM MSE =", dpcm_mse)
+print("DM MSE   =", dm_mse)
+print("ADM MSE  =", adm_mse)
+
+# ============================================================
+# MSE VS STEP SIZE
+# ============================================================
+
+delta_range = np.linspace(Delta/5, Delta*5, 20)
+mse_values = []
+
+for d in delta_range:
+    _, stair, mse = delta_modulation(slow_signal, d)
+    mse_values.append(mse)
+
+# ============================================================
+# PLOTS
+# ============================================================
+
+plt.figure(figsize=(15, 12))
+
+# ------------------------------------------------------------
+# ORIGINAL VS PREDICTED
+# ------------------------------------------------------------
+
+plt.subplot(2, 2, 1)
+plt.plot(t, slow_signal, label="Original")
+plt.plot(t, predicted, '--', label="Predicted")
+plt.title("Original vs Predicted Samples")
+plt.xlabel("Time")
+plt.ylabel("Amplitude")
+plt.legend()
+plt.grid(True)
+
+# ------------------------------------------------------------
+# PREDICTION ERROR
+# ------------------------------------------------------------
+
+plt.subplot(2, 2, 2)
+plt.plot(t, prediction_error)
+plt.title("Prediction Error")
+plt.xlabel("Time")
+plt.ylabel("Error")
+plt.grid(True)
+
+# ------------------------------------------------------------
+# DELTA STAIRCASE
+# ------------------------------------------------------------
+
+plt.subplot(2, 2, 3)
+plt.plot(t, slow_signal, label="Original")
+plt.step(t, dm_staircase, where='post', label="Delta Staircase")
+plt.title("Delta Modulation Staircase")
+plt.xlabel("Time")
+plt.ylabel("Amplitude")
+plt.legend()
+plt.grid(True)
+
+# ------------------------------------------------------------
+# MSE VS STEP SIZE
+# ------------------------------------------------------------
+
+plt.subplot(2, 2, 4)
+plt.plot(delta_range, mse_values, marker='o')
+plt.title("MSE vs Step Size")
+plt.xlabel("Step Size Δ")
+plt.ylabel("MSE")
+plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# RAPIDLY VARYING SIGNAL TEST
+# ============================================================
+
+_, rapid_staircase, rapid_mse = delta_modulation(rapid_signal, Delta)
+
+print("\n==============================")
+print("RAPID SIGNAL TEST")
+print("==============================")
+
+print("Rapid Signal MSE =", rapid_mse)
+
+if rapid_mse > dm_mse:
+    print("Slope Overload Distortion Observed")
+else:
+    print("No Significant Slope Overload")
+
+# ============================================================
+# INTERPRETATION
+# ============================================================
+
+print("\n==============================")
+print("OBSERVATION")
+print("==============================")
+
+print("Small Δ  -> Slope Overload Distortion")
+print("Large Δ  -> Granular Noise")
+print("Moderate Δ -> Best Tracking")
+print("DPCM should give lower error than PCM")
+print("ADM should improve tracking performance")
